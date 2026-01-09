@@ -42,25 +42,95 @@ export default function Home() {
   const [callCountInput, setCallCountInput] = useState<string>('1000')
   const [currentPage, setCurrentPage] = useState<number>(1)
   const [activeTab, setActiveTab] = useState<'manual' | 'batch'>('manual')
-  const [batchMode, setBatchMode] = useState<'sequential' | 'parallel'>('sequential')
-  const [threadCount, setThreadCount] = useState<number>(5)
-  const [threadCountInput, setThreadCountInput] = useState<string>('5')
   const [manualRepeatCount, setManualRepeatCount] = useState<number>(1)
   const [manualRepeatCountInput, setManualRepeatCountInput] = useState<string>('1')
   const [responseTimeData, setResponseTimeData] = useState<ResponseTimeData[]>([])
   const [logs, setLogs] = useState<string[]>([])
   const [apiLogs, setApiLogs] = useState<ApiLogEntry[]>([])
+  const [testStartTime, setTestStartTime] = useState<string | null>(null)
+  const [testEndTime, setTestEndTime] = useState<string | null>(null)
+  const [showConfigPanel, setShowConfigPanel] = useState<boolean>(false)
+  
+  const [uiUpdateInterval, setUiUpdateInterval] = useState<number>(500)
+  const [graphMaxPoints, setGraphMaxPoints] = useState<number>(100)
+  const [logMaxEntries, setLogMaxEntries] = useState<number>(100)
+  const [apiLogMaxEntries, setApiLogMaxEntries] = useState<number>(100)
+  
   const abortControllerRef = useRef<AbortController | null>(null)
   const resultsPerPage = 20
   
-  // Use refs to batch graph updates
   const graphDataBufferRef = useRef<ResponseTimeData[]>([])
-  const graphUpdateTimerRef = useRef<NodeJS.Timeout | null>(null)
-  const graphSequenceRef = useRef<number>(0) // Sequential index for unique X-axis values
+  const graphSequenceRef = useRef<number>(0)
   
-  // Optimized graph update function (batched with sequential indexing)
-  const addGraphDataPoint = useCallback((result: ApiResult) => {
-    // Use sequential index for unique X-axis values (prevents timestamp collisions)
+  const batchResultsRef = useRef<ApiResult[]>([])
+  const manualResultsRef = useRef<ApiResult[]>([])
+  const apiLogsRef = useRef<ApiLogEntry[]>([])
+  const logsRef = useRef<string[]>([])
+  const statsRef = useRef({ total: 0, success: 0, error: 0, averageTime: 0 })
+  
+  const uiUpdateIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const uiUpdateRequestRef = useRef<number | null>(null)
+  
+  const BATCH_UPDATE_THRESHOLD = 10
+  
+  const formatTimeHHMMSS = useCallback((date: Date): string => {
+    const hours = String(date.getHours()).padStart(2, '0')
+    const minutes = String(date.getMinutes()).padStart(2, '0')
+    const seconds = String(date.getSeconds()).padStart(2, '0')
+    return `${hours}${minutes}${seconds}`
+  }, [])
+  
+  const updateUIAsync = useCallback(() => {
+    if (uiUpdateRequestRef.current) {
+      cancelAnimationFrame(uiUpdateRequestRef.current)
+    }
+    
+    uiUpdateRequestRef.current = requestAnimationFrame(() => {
+      if (graphDataBufferRef.current.length > 0) {
+        setResponseTimeData(prev => {
+          const buffer = graphDataBufferRef.current
+          graphDataBufferRef.current = []
+          const totalLength = prev.length + buffer.length
+          if (totalLength <= graphMaxPoints) {
+            return [...prev, ...buffer]
+          }
+          const trimmed = prev.slice(-(graphMaxPoints - buffer.length))
+          return [...trimmed, ...buffer]
+        })
+      }
+      
+      const currentBatchLength = batchResultsRef.current.length
+      if (currentBatchLength > 0 && currentBatchLength !== results.length) {
+        setResults([...batchResultsRef.current])
+      }
+      
+      if (activeTab === 'manual') {
+        const currentManualLength = manualResultsRef.current.length
+        if (currentManualLength > 0 && currentManualLength !== manualResults.length) {
+          setManualResults([...manualResultsRef.current])
+        }
+      }
+      
+      setStats({ ...statsRef.current })
+      
+      if (logsRef.current.length > 0) {
+        setLogs(prev => [...logsRef.current, ...prev].slice(0, logMaxEntries))
+        logsRef.current = []
+      }
+      
+      if (apiLogsRef.current.length > 0) {
+        setApiLogs(prev => {
+          const newLogs = [...prev, ...apiLogsRef.current]
+          apiLogsRef.current = []
+          return newLogs.slice(-apiLogMaxEntries)
+        })
+      }
+      
+      uiUpdateRequestRef.current = null
+    })
+  }, [graphMaxPoints, logMaxEntries, apiLogMaxEntries, results.length, manualResults.length, activeTab])
+  
+  const addGraphDataPointToRef = useCallback((result: ApiResult) => {
     graphSequenceRef.current += 1
     const timeLabel = graphSequenceRef.current.toString()
     
@@ -71,29 +141,31 @@ export default function Home() {
       error: result.status === 'error' ? 1 : 0,
     })
     
-    // Batch graph updates every 5 points or 100ms for smoother visualization
-    // Reduced batch size to minimize visual artifacts from batching
-    if (graphDataBufferRef.current.length >= 5 || !graphUpdateTimerRef.current) {
-      if (graphUpdateTimerRef.current) {
-        clearTimeout(graphUpdateTimerRef.current)
-      }
-      setResponseTimeData(prev => {
-        const newData = [...prev, ...graphDataBufferRef.current]
-        graphDataBufferRef.current = []
-        return newData.slice(-100) // Keep last 100 data points
-      })
-      graphUpdateTimerRef.current = null
-    } else if (!graphUpdateTimerRef.current) {
-      graphUpdateTimerRef.current = setTimeout(() => {
-        setResponseTimeData(prev => {
-          const newData = [...prev, ...graphDataBufferRef.current]
-          graphDataBufferRef.current = []
-          return newData.slice(-100)
-        })
-        graphUpdateTimerRef.current = null
-      }, 100) // Reduced timeout for more frequent updates
+    if (graphDataBufferRef.current.length >= BATCH_UPDATE_THRESHOLD) {
+      updateUIAsync()
     }
-  }, [])
+  }, [updateUIAsync])
+  
+  const startUIUpdateLoop = useCallback(() => {
+    if (uiUpdateIntervalRef.current) {
+      clearInterval(uiUpdateIntervalRef.current)
+    }
+    uiUpdateIntervalRef.current = setInterval(() => {
+      updateUIAsync()
+    }, uiUpdateInterval)
+  }, [updateUIAsync, uiUpdateInterval])
+  
+  const stopUIUpdateLoop = useCallback(() => {
+    if (uiUpdateIntervalRef.current) {
+      clearInterval(uiUpdateIntervalRef.current)
+      uiUpdateIntervalRef.current = null
+    }
+    if (uiUpdateRequestRef.current) {
+      cancelAnimationFrame(uiUpdateRequestRef.current)
+      uiUpdateRequestRef.current = null
+    }
+    updateUIAsync()
+  }, [updateUIAsync])
 
   const API_BASE_URL = 'https://internal.api.rer.nft:5543/gateway/internal/YakeenService/v1.0/getCitizenInfo'
 
@@ -108,56 +180,28 @@ export default function Home() {
     averageTime: 0,
   })
 
-  // Generate random dateString (YYYY-MM format, year between 1400-1500)
   const generateRandomDateString = (): string => {
     const year = Math.floor(Math.random() * 100) + 1400 // 1400-1499
     const month = String(Math.floor(Math.random() * 12) + 1).padStart(2, '0')
     return `${year}-${month}`
   }
 
-  // Generate random NIN (9 digits)
   const generateRandomNIN = (): string => {
     return String(Math.floor(Math.random() * 900000000) + 100000000)
   }
 
-  // Batch log updates to reduce re-renders
-  const logBufferRef = useRef<string[]>([])
-  const apiLogBufferRef = useRef<ApiLogEntry[]>([])
-  const logUpdateTimerRef = useRef<NodeJS.Timeout | null>(null)
-
-  // Add log entry (batched)
   const addLog = useCallback((message: string) => {
     const timestamp = new Date().toLocaleTimeString()
-    logBufferRef.current.push(`[${timestamp}] ${message}`)
-    
-    // Batch log updates every 100ms or when buffer reaches 10 entries
-    if (logBufferRef.current.length >= 10 || !logUpdateTimerRef.current) {
-      if (logUpdateTimerRef.current) {
-        clearTimeout(logUpdateTimerRef.current)
-      }
-      setLogs(prev => [...logBufferRef.current, ...prev].slice(0, 100))
-      logBufferRef.current = []
-      logUpdateTimerRef.current = null
-    } else if (!logUpdateTimerRef.current) {
-      logUpdateTimerRef.current = setTimeout(() => {
-        setLogs(prev => [...logBufferRef.current, ...prev].slice(0, 100))
-        logBufferRef.current = []
-        logUpdateTimerRef.current = null
-      }, 100)
-    }
+    logsRef.current.push(`[${timestamp}] ${message}`)
   }, [])
 
-  // Add API log entry (batched and optimized)
-  // Optimized: avoid JSON.stringify when possible, use faster string conversion
   const addApiLog = useCallback((statusCode: number, response: any, time: number) => {
-    // Fast string conversion - avoid JSON.stringify when not needed
     let preview = ''
     if (response !== null && response !== undefined) {
       const responseType = typeof response
       if (responseType === 'string') {
         preview = response.length > 50 ? response.substring(0, 50) + '...' : response
       } else if (responseType === 'object') {
-        // Only stringify if absolutely necessary (for objects)
         try {
           const responseStr = JSON.stringify(response)
           preview = responseStr.length > 50 ? responseStr.substring(0, 50) + '...' : responseStr
@@ -165,27 +209,15 @@ export default function Home() {
           preview = String(response).substring(0, 50)
         }
       } else {
-        // For primitives, use fast String() conversion
         const responseStr = String(response)
         preview = responseStr.length > 50 ? responseStr.substring(0, 50) + '...' : responseStr
       }
     }
     
-    const serial = apiLogs.length + apiLogBufferRef.current.length + 1
-    apiLogBufferRef.current.push({ serial, statusCode, responsePreview: preview, time })
-    
-    // Batch API log updates every 10 entries or 200ms
-    if (apiLogBufferRef.current.length >= 10) {
-      setApiLogs(prev => {
-        const newLogs = [...prev, ...apiLogBufferRef.current]
-        apiLogBufferRef.current = []
-        return newLogs.slice(-100) // Keep last 100 logs
-      })
-    }
-  }, [apiLogs.length])
+    const serial = apiLogsRef.current.length + 1
+    apiLogsRef.current.push({ serial, statusCode, responsePreview: preview, time })
+  }, [])
 
-  // Make a single API call with specific parameters
-  // Optimized for sequential mode: collect logs in buffer instead of updating state immediately
   const makeApiCallWithParams = async (
     id: number,
     dateString: string,
@@ -197,15 +229,12 @@ export default function Home() {
     apiLogBuffer?: ApiLogEntry[]
   ): Promise<ApiResult> => {
     try {
-      // Use Next.js API route as proxy to bypass CORS
-      // Optimized: build URL efficiently without template literals overhead
       const proxyUrl = `/api/proxy?dateString=${encodeURIComponent(dateString)}&nin=${encodeURIComponent(nin)}`
       
-      // Use fetch with keepalive for better connection reuse (browser optimization)
       const response = await fetch(proxyUrl, {
         method: 'GET',
         signal,
-        keepalive: true, // Enable keepalive for connection reuse
+        keepalive: true,
       })
 
       let proxyData
@@ -213,7 +242,6 @@ export default function Home() {
       try {
         proxyData = await response.json()
       } catch {
-        // If we can't parse the response, we don't have response time info
         const statusCode = response.status || 500
         const result: ApiResult = {
           id,
@@ -236,7 +264,6 @@ export default function Home() {
             addLog(logMessage)
           }
           if (apiLogBuffer) {
-            // Serial will be corrected when flushing at the end
             apiLogBuffer.push({ serial: 0, statusCode, responsePreview: `Failed to parse: ${response.statusText}`, time: result.duration })
           } else {
             addApiLog(statusCode, `Failed to parse: ${response.statusText}`, result.duration)
@@ -245,11 +272,9 @@ export default function Home() {
         return result
       }
 
-      // Use actual API response time from proxy (measured on server side)
       const apiResponseTime = proxyData.responseTime || 0
       const statusCode = proxyData.status || response.status || 500
 
-      // Check if proxy returned an error
       if (!response.ok || proxyData.error) {
         const result: ApiResult = {
           id,
@@ -266,13 +291,11 @@ export default function Home() {
           const logPrefix = isManual ? 'Manual' : 'Call'
           const logMessage = `${logPrefix} #${id}: ERROR - ${result.error} - dateString: ${dateString}, nin: ${nin} - ${apiResponseTime}ms`
           if (logBuffer) {
-            // Collect in buffer for sequential mode
             const timestamp = new Date().toLocaleTimeString()
             logBuffer.push(`[${timestamp}] ${logMessage}`)
           } else {
             addLog(logMessage)
           }
-          // Prepare API log preview
           let preview = ''
           const errorData = proxyData.error || proxyData
           if (errorData !== null && errorData !== undefined) {
@@ -291,7 +314,6 @@ export default function Home() {
             }
           }
           if (apiLogBuffer) {
-            // Serial will be corrected when flushing at the end
             apiLogBuffer.push({ serial: 0, statusCode, responsePreview: preview, time: result.duration })
           } else {
             addApiLog(statusCode, errorData, result.duration)
@@ -321,7 +343,6 @@ export default function Home() {
         } else {
           addLog(logMessage)
         }
-        // Prepare API log preview
         let preview = ''
         if (proxyData.data !== null && proxyData.data !== undefined) {
           const dataType = typeof proxyData.data
@@ -335,12 +356,11 @@ export default function Home() {
               preview = String(proxyData.data).substring(0, 50)
             }
           } else {
-            preview = String(proxyData.data).substring(0, 50)
+              preview = String(proxyData.data).substring(0, 50)
+            }
           }
-        }
-        if (apiLogBuffer) {
-          // Serial will be corrected when flushing at the end
-          apiLogBuffer.push({ serial: 0, statusCode, responsePreview: preview, time: result.duration })
+          if (apiLogBuffer) {
+            apiLogBuffer.push({ serial: 0, statusCode, responsePreview: preview, time: result.duration })
         } else {
           addApiLog(statusCode, proxyData.data, result.duration)
         }
@@ -367,7 +387,7 @@ export default function Home() {
         error: errorMessage,
         duration: responseTime,
         timestamp: Date.now(),
-        statusCode: 0, // Network/abort errors don't have status codes
+        statusCode: 0,
       }
 
       if (error.name !== 'AbortError' && !skipLogging) {
@@ -376,13 +396,12 @@ export default function Home() {
         if (logBuffer) {
           // Collect in buffer for sequential mode
           const timestamp = new Date().toLocaleTimeString()
-          logBuffer.push(`[${timestamp}] ${logMessage}`)
-        } else {
-          addLog(logMessage)
-        }
-        if (apiLogBuffer) {
-          // Serial will be corrected when flushing at the end
-          apiLogBuffer.push({ serial: 0, statusCode: 0, responsePreview: errorMessage.length > 50 ? errorMessage.substring(0, 50) + '...' : errorMessage, time: result.duration })
+            logBuffer.push(`[${timestamp}] ${logMessage}`)
+          } else {
+            addLog(logMessage)
+          }
+          if (apiLogBuffer) {
+            apiLogBuffer.push({ serial: 0, statusCode: 0, responsePreview: errorMessage.length > 50 ? errorMessage.substring(0, 50) + '...' : errorMessage, time: result.duration })
         } else {
           addApiLog(0, errorMessage, result.duration)
         }
@@ -393,15 +412,12 @@ export default function Home() {
     }
   }
 
-  // Make a single API call with random parameters (for batch testing)
-  // Optimized: collect logs in buffer for sequential mode instead of updating state
   const makeApiCall = async (id: number, signal?: AbortSignal, skipLogging: boolean = false, logBuffer?: string[], apiLogBuffer?: ApiLogEntry[]): Promise<ApiResult> => {
     const dateString = generateRandomDateString()
     const nin = generateRandomNIN()
     return makeApiCallWithParams(id, dateString, nin, signal, false, skipLogging, logBuffer, apiLogBuffer)
   }
 
-  // Stop batch calls
   const stopBatchCalls = () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
@@ -411,99 +427,96 @@ export default function Home() {
     }
   }
 
-  // Run manual tests independently
   const runManualTests = async (): Promise<void> => {
     setIsRunning(true)
     setManualResults([])
-    graphSequenceRef.current = 0 // Reset sequence counter
-    addLog(`Starting manual tests (repeat count: ${manualRepeatCount})...`)
+    setResponseTimeData([])
+    setApiLogs([])
+    graphSequenceRef.current = 0
+    
+    manualResultsRef.current = []
+    graphDataBufferRef.current = []
+    apiLogsRef.current = []
+    logsRef.current = []
+    statsRef.current = { total: 0, success: 0, error: 0, averageTime: 0 }
+    
+    const startDate = new Date()
+    const startTimeFormatted = formatTimeHHMMSS(startDate)
+    setTestStartTime(startTimeFormatted)
+    setTestEndTime(null)
+    
+    addLog(`Starting manual tests (repeat count: ${manualRepeatCount}) at ${startTimeFormatted}...`)
 
-    const manualTestResults: ApiResult[] = []
+    startUIUpdateLoop()
+
     let callId = 1
     const startTime = Date.now()
-    
-    // Aggressive batching: update state every 20 calls for maximum performance
-    const updateInterval = 20
-    let totalCalls = 0
     
     for (let i = 0; i < manualParams.length; i++) {
       const params = manualParams[i]
       if (params.dateString.trim() && params.nin.trim()) {
-        // Repeat the same call based on repeat count
         for (let repeat = 0; repeat < manualRepeatCount; repeat++) {
           addLog(`Running manual test #${callId} (repeat ${repeat + 1}/${manualRepeatCount}): dateString=${params.dateString}, nin=${params.nin}`)
           const result = await makeApiCallWithParams(callId, params.dateString.trim(), params.nin.trim(), undefined, true)
-          manualTestResults.push(result)
-          totalCalls++
           
-          // Update response time graph data (batched for performance)
-          addGraphDataPoint(result)
+          manualResultsRef.current.push(result)
           
-          // Update state every N calls or on last call to reduce re-renders
-          // Use React 18 automatic batching
-          if (totalCalls % updateInterval === 0 || (i === manualParams.length - 1 && repeat === manualRepeatCount - 1)) {
-            setManualResults([...manualTestResults])
+          statsRef.current.total++
+          if (result.status === 'success') {
+            statsRef.current.success++
+          } else {
+            statsRef.current.error++
           }
+          statsRef.current.averageTime = (statsRef.current.averageTime * (statsRef.current.total - 1) + result.duration) / statsRef.current.total
+          
+          addGraphDataPointToRef(result)
           
           callId++
         }
       }
     }
     
-    // Flush any remaining buffered updates
-    if (graphDataBufferRef.current.length > 0) {
-      setResponseTimeData(prev => {
-        const newData = [...prev, ...graphDataBufferRef.current]
-        graphDataBufferRef.current = []
-        return newData.slice(-100)
-      })
-    }
-    if (apiLogBufferRef.current.length > 0) {
-      setApiLogs(prev => {
-        const newLogs = [...prev, ...apiLogBufferRef.current]
-        apiLogBufferRef.current = []
-        return newLogs.slice(-100)
-      })
-    }
-    if (logBufferRef.current.length > 0) {
-      setLogs(prev => [...logBufferRef.current, ...prev].slice(0, 100))
-      logBufferRef.current = []
-    }
-    if (logUpdateTimerRef.current) {
-      clearTimeout(logUpdateTimerRef.current)
-      logUpdateTimerRef.current = null
-    }
-    if (graphUpdateTimerRef.current) {
-      clearTimeout(graphUpdateTimerRef.current)
-      graphUpdateTimerRef.current = null
-    }
+    stopUIUpdateLoop()
     
-    setManualResults(manualTestResults)
     setIsRunning(false)
     const endTime = Date.now()
+    const endDate = new Date()
+    const endTimeFormatted = formatTimeHHMMSS(endDate)
+    setTestEndTime(endTimeFormatted)
     const totalDuration = (endTime - startTime) / 1000 // in seconds
-    if (manualTestResults.length > 0) {
-      addLog(`Completed ${manualTestResults.length} manual test(s) in ${totalDuration.toFixed(2)}s`)
+    if (manualResultsRef.current.length > 0) {
+      addLog(`Completed ${manualResultsRef.current.length} manual test(s) in ${totalDuration.toFixed(2)}s. Started: ${startTimeFormatted}, Ended: ${endTimeFormatted}`)
     } else {
       addLog('No manual tests to run. Please fill in dateString and nin.')
     }
   }
 
-  // Run batch of API calls
   const runBatchCalls = async (count: number = 1000) => {
     setIsRunning(true)
+    batchResultsRef.current = []
+    graphDataBufferRef.current = []
+    apiLogsRef.current = []
+    logsRef.current = []
+    graphSequenceRef.current = 0
+    statsRef.current = { total: 0, success: 0, error: 0, averageTime: 0 }
+    
     setResults([])
     setResponseTimeData([])
-    graphSequenceRef.current = 0 // Reset sequence counter for new test
     setStats({ total: 0, success: 0, error: 0, averageTime: 0 })
     setCurrentPage(1)
+    
+    const startDate = new Date()
+    const startTimeFormatted = formatTimeHHMMSS(startDate)
+    setTestStartTime(startTimeFormatted)
+    setTestEndTime(null)
     
     abortControllerRef.current = new AbortController()
     const signal = abortControllerRef.current.signal
 
-    addLog(`Starting batch test with ${count} API calls in ${batchMode} mode${batchMode === 'parallel' ? ` (${threadCount} threads)` : ''}`)
+    addLog(`Starting batch test with ${count} API calls at ${startTimeFormatted}`)
+    
+    startUIUpdateLoop()
 
-    // Get correct test values from environment
     let correctDateString = ''
     let correctNIN = ''
     
@@ -519,204 +532,55 @@ export default function Home() {
       addLog('Warning: Could not fetch test values from environment variables')
     }
     
-    // Validate that we have the required values
     if (!correctDateString || !correctNIN) {
       addLog('Error: CORRECT_TEST_DATESTRING and CORRECT_TEST_NIN must be set in environment variables')
       setIsRunning(false)
       return
     }
 
-    const batchResults: ApiResult[] = []
-    let successCount = 0
-    let errorCount = 0
-    let totalTime = 0
-    
-    // Declare graphDataPoints early for sequential mode optimization
-    let graphDataPoints: ResponseTimeData[] = []
-    
-    // Buffers to collect logs during sequential execution (will be flushed at the end)
-    const sequentialLogBuffer: string[] = []
-    const sequentialApiLogBuffer: ApiLogEntry[] = []
-
-    // Always start with the correct test values as the first call
     if (!signal.aborted) {
-      // In sequential mode, collect logs in buffer instead of updating state
-      const skipLoggingForFirst = batchMode === 'sequential'
-      if (!skipLoggingForFirst) {
-        addLog(`Running correct test values first: dateString=${correctDateString}, nin=${correctNIN}`)
-      } else {
-        // Collect first call log in buffer
-        const timestamp = new Date().toLocaleTimeString()
-        sequentialLogBuffer.push(`[${timestamp}] Running correct test values first: dateString=${correctDateString}, nin=${correctNIN}`)
-      }
-      const correctTestResult = await makeApiCallWithParams(1, correctDateString, correctNIN, signal, false, skipLoggingForFirst, batchMode === 'sequential' ? sequentialLogBuffer : undefined, batchMode === 'sequential' ? sequentialApiLogBuffer : undefined)
-      batchResults.push(correctTestResult)
+      addLog(`Running correct test values first: dateString=${correctDateString}, nin=${correctNIN}`)
+      const correctTestResult = await makeApiCallWithParams(1, correctDateString, correctNIN, signal, false, false)
       
-      // Fast status counting (avoid if-else branching overhead)
-      successCount += correctTestResult.status === 'success' ? 1 : 0
-      errorCount += correctTestResult.status === 'error' ? 1 : 0
-      totalTime += correctTestResult.duration
-
-      // In sequential mode, collect graph data but don't update state yet
-      if (batchMode === 'sequential') {
-        graphSequenceRef.current += 1
-        graphDataPoints.push({
-          time: graphSequenceRef.current.toString(),
-          duration: correctTestResult.duration,
-          success: correctTestResult.status === 'success' ? 1 : 0,
-          error: correctTestResult.status === 'error' ? 1 : 0,
-        })
+      batchResultsRef.current.push(correctTestResult)
+      
+      statsRef.current.total++
+      if (correctTestResult.status === 'success') {
+        statsRef.current.success++
       } else {
-        // Update response time graph data (batched for performance) - only in parallel mode
-        addGraphDataPoint(correctTestResult)
+        statsRef.current.error++
       }
-
-      // Update state after first call
-      setResults([...batchResults])
-      setStats({
-        total: batchResults.length,
-        success: successCount,
-        error: errorCount,
-        averageTime: totalTime / batchResults.length || 0,
-      })
+      statsRef.current.averageTime = correctTestResult.duration
+      
+      addGraphDataPointToRef(correctTestResult)
     }
 
-    // Process remaining calls based on mode
-    const remainingCalls = count - 1 // Subtract 1 because we already did the first call
+    const remainingCalls = count - 1
 
     try {
-      if (batchMode === 'sequential') {
-        // Sequential mode: process one by one
-        // MAXIMUM PERFORMANCE: update state every 100 calls to minimize React re-renders
-        // Disable graph/log updates during execution for maximum speed
-        const updateInterval = 100
+      for (let i = 0; i < remainingCalls; i++) {
+        if (signal.aborted) break
         
-        for (let i = 0; i < remainingCalls; i++) {
-          if (signal.aborted) break
-          
-          // Make API call - collect logs in buffer instead of updating state (fastest path)
-          const apiResult = await makeApiCall(i + 2, signal, true, sequentialLogBuffer, sequentialApiLogBuffer) // +2 because call #1 was the correct test
-          batchResults.push(apiResult)
-          
-          // Fast status counting (avoid if-else branching overhead)
-          successCount += apiResult.status === 'success' ? 1 : 0
-          errorCount += apiResult.status === 'error' ? 1 : 0
-          totalTime += apiResult.duration
-
-          // Collect graph data points but don't update state (defer to end)
-          graphSequenceRef.current += 1
-          graphDataPoints.push({
-            time: graphSequenceRef.current.toString(),
-            duration: apiResult.duration,
-            success: apiResult.status === 'success' ? 1 : 0,
-            error: apiResult.status === 'error' ? 1 : 0,
-          })
-
-          // Update state only every N calls or on last call to minimize re-renders
-          if ((i + 1) % updateInterval === 0 || i === remainingCalls - 1) {
-            // Use React 18 automatic batching - these will be batched together
-            setResults([...batchResults])
-            setStats({
-              total: batchResults.length,
-              success: successCount,
-              error: errorCount,
-              averageTime: totalTime / batchResults.length || 0,
-            })
-          }
-        }
+        const apiResult = await makeApiCall(i + 2, signal, false)
         
-        // Update graph data once at the end (much faster than incremental updates)
-        if (graphDataPoints.length > 0) {
-          setResponseTimeData(prev => {
-            const newData = [...prev, ...graphDataPoints]
-            return newData.slice(-100) // Keep last 100 data points
-          })
-        }
+        batchResultsRef.current.push(apiResult)
         
-        // Flush all collected logs at the end (show logs towards the end)
-        if (sequentialLogBuffer.length > 0) {
-          setLogs(prev => [...sequentialLogBuffer, ...prev].slice(0, 100))
+        statsRef.current.total++
+        if (apiResult.status === 'success') {
+          statsRef.current.success++
+        } else {
+          statsRef.current.error++
         }
-        if (sequentialApiLogBuffer.length > 0) {
-          // Update serial numbers to account for existing logs
-          setApiLogs(prev => {
-            const existingLogCount = prev.length
-            sequentialApiLogBuffer.forEach((log, index) => {
-              log.serial = existingLogCount + index + 1
-            })
-            const newLogs = [...prev, ...sequentialApiLogBuffer]
-            return newLogs.slice(-100) // Keep last 100 logs
-          })
-        }
-      } else {
-        // Parallel mode: process in batches with configurable thread count
-        const totalBatches = Math.ceil(remainingCalls / threadCount)
-
-        for (let batch = 0; batch < totalBatches; batch++) {
-          if (signal.aborted) break
-
-          const batchPromises: Promise<ApiResult>[] = []
-          const startIdx = batch * threadCount
-          const endIdx = Math.min(startIdx + threadCount, remainingCalls)
-
-          for (let i = startIdx; i < endIdx; i++) {
-            if (signal.aborted) break
-            // Use i + 2 because call #1 was the correct test, so next call is #2
-            batchPromises.push(makeApiCall(i + 2, signal))
-          }
-
-          const batchResultsChunk = await Promise.allSettled(batchPromises)
-          
-          batchResultsChunk.forEach((result, idx) => {
-            if (result.status === 'fulfilled') {
-              const apiResult = result.value
-              batchResults.push(apiResult)
-              
-              if (apiResult.status === 'success') {
-                successCount++
-              } else {
-                errorCount++
-              }
-              totalTime += apiResult.duration
-
-              // Update response time graph data (batched for performance)
-              addGraphDataPoint(apiResult)
-            } else {
-              const errorResult: ApiResult = {
-                id: startIdx + idx + 2, // +2 because call #1 was the correct test
-                dateString: generateRandomDateString(),
-                nin: generateRandomNIN(),
-                status: 'error',
-                error: result.reason?.message || 'Promise rejected',
-                duration: 0,
-                timestamp: Date.now(),
-              }
-              batchResults.push(errorResult)
-              errorCount++
-            }
-          })
-
-          // Update state after each batch
-          setResults([...batchResults])
-          setStats({
-            total: batchResults.length,
-            success: successCount,
-            error: errorCount,
-            averageTime: totalTime / batchResults.length || 0,
-          })
-
-          // Reduced delay for better performance (only if needed)
-          if (batch < totalBatches - 1 && !signal.aborted && threadCount > 20) {
-            await new Promise(resolve => setTimeout(resolve, 10))
-          }
-        }
+        const currentTotal = statsRef.current.total
+        statsRef.current.averageTime = (statsRef.current.averageTime * (currentTotal - 1) + apiResult.duration) / currentTotal
+        
+        addGraphDataPointToRef(apiResult)
       }
     } catch (error: any) {
       if (error.name !== 'AbortError') {
         addLog(`Error during batch testing: ${error.message}`)
       }
     } finally {
-      // Flush any remaining buffered updates
       if (graphDataBufferRef.current.length > 0) {
         setResponseTimeData(prev => {
           const newData = [...prev, ...graphDataBufferRef.current]
@@ -724,44 +588,39 @@ export default function Home() {
           return newData.slice(-100)
         })
       }
-      if (apiLogBufferRef.current.length > 0) {
-        setApiLogs(prev => {
-          const newLogs = [...prev, ...apiLogBufferRef.current]
-          apiLogBufferRef.current = []
-          return newLogs.slice(-100)
-        })
-      }
-      if (logBufferRef.current.length > 0) {
-        setLogs(prev => [...logBufferRef.current, ...prev].slice(0, 100))
-        logBufferRef.current = []
-      }
-      if (logUpdateTimerRef.current) {
-        clearTimeout(logUpdateTimerRef.current)
-        logUpdateTimerRef.current = null
-      }
-      if (graphUpdateTimerRef.current) {
-        clearTimeout(graphUpdateTimerRef.current)
-        graphUpdateTimerRef.current = null
-      }
+      
+      stopUIUpdateLoop()
       
       setIsRunning(false)
       abortControllerRef.current = null
       if (!signal.aborted) {
-        addLog(`Batch test completed: ${successCount} successful, ${errorCount} errors`)
+        const endDate = new Date()
+        const endTimeFormatted = formatTimeHHMMSS(endDate)
+        setTestEndTime(endTimeFormatted)
+        addLog(`Batch test completed: ${statsRef.current.success} successful, ${statsRef.current.error} errors. Started: ${testStartTime}, Ended: ${endTimeFormatted}`)
+        updateUIAsync()
       }
     }
   }
 
   const clearResults = () => {
+    batchResultsRef.current = []
+    manualResultsRef.current = []
+    graphDataBufferRef.current = []
+    apiLogsRef.current = []
+    logsRef.current = []
+    graphSequenceRef.current = 0
+    statsRef.current = { total: 0, success: 0, error: 0, averageTime: 0 }
+    
     setResults([])
     setManualResults([])
     setResponseTimeData([])
-    graphSequenceRef.current = 0 // Reset sequence counter
     setLogs([])
     setApiLogs([])
     setStats({ total: 0, success: 0, error: 0, averageTime: 0 })
     setCurrentPage(1)
-    // Sync input field
+    setTestStartTime(null)
+    setTestEndTime(null)
     setCallCountInput(callCount.toString())
   }
 
@@ -887,44 +746,43 @@ export default function Home() {
   const endIndex = startIndex + resultsPerPage
   const paginatedResults = results.slice(startIndex, endIndex)
   
-  // Pagination for manual results
   const [manualCurrentPage, setManualCurrentPage] = useState<number>(1)
   const manualTotalPages = Math.ceil(manualResults.length / resultsPerPage)
   const manualStartIndex = (manualCurrentPage - 1) * resultsPerPage
   const manualEndIndex = manualStartIndex + resultsPerPage
   const paginatedManualResults = manualResults.slice(manualStartIndex, manualEndIndex)
   
-  // Calculate total time from all API calls (batch + manual)
-  const allResults = [...results, ...manualResults]
-  const totalTime = allResults.reduce((sum, result) => sum + result.duration, 0)
-  const averageTime = allResults.length > 0 ? totalTime / allResults.length : 0
-  
-  // Calculate average requests per minute
-  // If we have results, calculate based on time span from first to last call
-  let requestsPerMinute = 0
-  if (allResults.length > 0) {
-    const firstCallTime = Math.min(...allResults.map(r => r.timestamp))
-    const lastCallTime = Math.max(...allResults.map(r => r.timestamp))
-    const timeSpanSeconds = (lastCallTime - firstCallTime) / 1000
-    if (timeSpanSeconds > 0) {
-      requestsPerMinute = (allResults.length / timeSpanSeconds) * 60
-    } else if (allResults.length > 0) {
-      // If all calls happened at the same time (unlikely but handle edge case)
-      requestsPerMinute = allResults.length * 60
+  const statsCalculated = useMemo(() => {
+    const allResults = [...results, ...manualResults]
+    const totalTime = allResults.reduce((sum, result) => sum + result.duration, 0)
+    const averageTime = allResults.length > 0 ? totalTime / allResults.length : 0
+    
+    let requestsPerMinute = 0
+    if (allResults.length > 0) {
+      const timestamps = allResults.map(r => r.timestamp)
+      const firstCallTime = Math.min(...timestamps)
+      const lastCallTime = Math.max(...timestamps)
+      const timeSpanSeconds = (lastCallTime - firstCallTime) / 1000
+      if (timeSpanSeconds > 0) {
+        requestsPerMinute = (allResults.length / timeSpanSeconds) * 60
+      } else if (allResults.length > 0) {
+        requestsPerMinute = allResults.length * 60
+      }
     }
-  }
+    
+    return { totalTime, averageTime, requestsPerMinute }
+  }, [results, manualResults])
+
+  const { totalTime, averageTime, requestsPerMinute } = statsCalculated
 
   useEffect(() => {
-    // Reset to first page when results change
     setCurrentPage(1)
   }, [results.length])
   
   useEffect(() => {
-    // Reset to first page when manual results change
     setManualCurrentPage(1)
   }, [manualResults.length])
 
-  // Fetch manual test values from environment on component mount
   useEffect(() => {
     const fetchManualTestValues = async () => {
       try {
@@ -947,9 +805,151 @@ export default function Home() {
 
   return (
     <div className="container">
-      <h1>Yakeen API Batch Tester</h1>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+        <h1>Yakeen API Batch Tester</h1>
+        <button
+          className="btn-secondary"
+          onClick={() => setShowConfigPanel(true)}
+          style={{ padding: '0.5rem 1rem', fontSize: '0.9rem' }}
+        >
+          ⚙️ Config
+        </button>
+      </div>
       
-      {/* API Info Section */}
+      {showConfigPanel && (
+        <div className="modal-overlay" onClick={() => setShowConfigPanel(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Performance Configuration</h2>
+              <button
+                className="modal-close"
+                onClick={() => setShowConfigPanel(false)}
+              >
+                ×
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="config-group">
+                <label className="config-label">
+                  UI Update Interval (ms)
+                  <input
+                    type="number"
+                    min="50"
+                    max="5000"
+                    step="50"
+                    value={uiUpdateInterval}
+                    onChange={(e) => {
+                      const value = parseInt(e.target.value, 10)
+                      if (!isNaN(value) && value >= 50 && value <= 5000) {
+                        setUiUpdateInterval(value)
+                      }
+                    }}
+                    className="config-input"
+                  />
+                  <small style={{ color: '#666', fontSize: '0.85rem' }}>
+                    Lower = more frequent UI updates (slower API testing). Higher = less frequent updates (faster API testing). Range: 50-5000ms
+                  </small>
+                </label>
+              </div>
+              
+              <div className="config-group">
+                <label className="config-label">
+                  Max Graph Data Points
+                  <input
+                    type="number"
+                    min="50"
+                    max="1000"
+                    step="50"
+                    value={graphMaxPoints}
+                    onChange={(e) => {
+                      const value = parseInt(e.target.value, 10)
+                      if (!isNaN(value) && value >= 50 && value <= 1000) {
+                        setGraphMaxPoints(value)
+                      }
+                    }}
+                    className="config-input"
+                  />
+                  <small style={{ color: '#666', fontSize: '0.85rem' }}>
+                    Maximum number of data points to keep in the graph. Higher = more memory usage. Range: 50-1000
+                  </small>
+                </label>
+              </div>
+              
+              <div className="config-group">
+                <label className="config-label">
+                  Max Log Entries
+                  <input
+                    type="number"
+                    min="50"
+                    max="500"
+                    step="50"
+                    value={logMaxEntries}
+                    onChange={(e) => {
+                      const value = parseInt(e.target.value, 10)
+                      if (!isNaN(value) && value >= 50 && value <= 500) {
+                        setLogMaxEntries(value)
+                      }
+                    }}
+                    className="config-input"
+                  />
+                  <small style={{ color: '#666', fontSize: '0.85rem' }}>
+                    Maximum number of log entries to keep. Higher = more memory usage. Range: 50-500
+                  </small>
+                </label>
+              </div>
+              
+              <div className="config-group">
+                <label className="config-label">
+                  Max API Log Entries
+                  <input
+                    type="number"
+                    min="50"
+                    max="500"
+                    step="50"
+                    value={apiLogMaxEntries}
+                    onChange={(e) => {
+                      const value = parseInt(e.target.value, 10)
+                      if (!isNaN(value) && value >= 50 && value <= 500) {
+                        setApiLogMaxEntries(value)
+                      }
+                    }}
+                    className="config-input"
+                  />
+                  <small style={{ color: '#666', fontSize: '0.85rem' }}>
+                    Maximum number of API log entries to keep. Higher = more memory usage. Range: 50-500
+                  </small>
+                </label>
+              </div>
+              
+              <div className="config-info" style={{ 
+                marginTop: '1rem', 
+                padding: '0.75rem', 
+                background: '#F0F0F0', 
+                borderRadius: '6px',
+                fontSize: '0.85rem',
+                color: '#333'
+              }}>
+                <strong>Performance Tips:</strong>
+                <ul style={{ marginTop: '0.5rem', paddingLeft: '1.5rem' }}>
+                  <li>For maximum API testing speed: Set UI Update Interval to 2000-5000ms</li>
+                  <li>For real-time visualization: Set UI Update Interval to 100-500ms</li>
+                  <li>Lower graph/log limits = less memory usage but less historical data</li>
+                  <li>Changes take effect on the next test run</li>
+                </ul>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="btn-primary"
+                onClick={() => setShowConfigPanel(false)}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      
       <div className="api-info-section">
         <div className="api-url-display">
           <div className="api-label">API Endpoint:</div>
@@ -959,214 +959,142 @@ export default function Home() {
 
       <div className="main-layout">
         <div className="left-column">
-          {/* Tab Navigation */}
-          <div className="tabs-container">
-            <button
-              className={`tab-button ${activeTab === 'manual' ? 'active' : ''}`}
-              onClick={() => setActiveTab('manual')}
-              disabled={isRunning}
-            >
-              Manual Testing
-            </button>
-            <button
-              className={`tab-button ${activeTab === 'batch' ? 'active' : ''}`}
-              onClick={() => setActiveTab('batch')}
-              disabled={isRunning}
-            >
-              Batch Testing
-            </button>
-          </div>
+          {/* Unified Testing Section */}
+          <div className="testing-section">
+            {/* Mode Selection */}
+            <div className="tabs-container" style={{ marginBottom: '1rem' }}>
+              <button
+                className={`tab-button ${activeTab === 'manual' ? 'active' : ''}`}
+                onClick={() => setActiveTab('manual')}
+                disabled={isRunning}
+              >
+                Manual Testing
+              </button>
+              <button
+                className={`tab-button ${activeTab === 'batch' ? 'active' : ''}`}
+                onClick={() => setActiveTab('batch')}
+                disabled={isRunning}
+              >
+                Batch Testing
+              </button>
+            </div>
 
-          {/* Manual Testing Section */}
-          {activeTab === 'manual' && (
-            <div className="testing-section manual-section">
-              <div className="config-section">
-                <div className="manual-params-grid">
-                {manualParams.map((param, index) => (
-                  <div key={index} className="manual-param-row">
-                    <div className="manual-param-inputs">
-                      <label className="manual-input-label">
-                        dateString:
-                        <input
-                          type="text"
-                          value={param.dateString}
-                          onChange={(e) => updateManualParam(index, 'dateString', e.target.value)}
-                          disabled={isRunning}
-                          placeholder="dateString"
-                          className="config-input manual-input"
-                        />
-                      </label>
-                      <label className="manual-input-label">
-                        nin:
-                        <input
-                          type="text"
-                          value={param.nin}
-                          onChange={(e) => updateManualParam(index, 'nin', e.target.value)}
-                          disabled={isRunning}
-                          placeholder="nin"
-                          className="config-input manual-input"
-                        />
-                      </label>
-                    </div>
+            {/* Configuration Section - Unified */}
+            <div className="config-section">
+              {activeTab === 'manual' ? (
+                <>
+                  <div className="manual-params-grid">
+                    {manualParams.map((param, index) => (
+                      <div key={index} className="manual-param-row">
+                        <div className="manual-param-inputs">
+                          <label className="manual-input-label">
+                            dateString:
+                            <input
+                              type="text"
+                              value={param.dateString}
+                              onChange={(e) => updateManualParam(index, 'dateString', e.target.value)}
+                              disabled={isRunning}
+                              placeholder="dateString"
+                              className="config-input manual-input"
+                            />
+                          </label>
+                          <label className="manual-input-label">
+                            nin:
+                            <input
+                              type="text"
+                              value={param.nin}
+                              onChange={(e) => updateManualParam(index, 'nin', e.target.value)}
+                              disabled={isRunning}
+                              placeholder="nin"
+                              className="config-input manual-input"
+                            />
+                          </label>
+                        </div>
+                      </div>
+                    ))}
                   </div>
-                ))}
-                </div>
-                <div className="config-row" style={{ marginTop: '0.75rem' }}>
-                  <label className="config-label">
-                    Repeat Count:
-                    <input
-                      type="number"
-                      min="1"
-                      max="50000"
-                      value={manualRepeatCountInput}
-                      onChange={(e) => {
-                        const inputValue = e.target.value
-                        setManualRepeatCountInput(inputValue)
-                        if (inputValue !== '') {
-                          const numValue = parseInt(inputValue, 10)
-                          if (!isNaN(numValue)) {
-                            const clampedValue = Math.max(1, Math.min(50000, numValue))
-                            setManualRepeatCount(clampedValue)
-                            // Update input to show clamped value if it exceeds max
-                            if (numValue > 50000) {
-                              setManualRepeatCountInput('50000')
+                  <div className="config-row" style={{ marginTop: '0.75rem' }}>
+                    <label className="config-label">
+                      Repeat Count:
+                      <input
+                        type="number"
+                        min="1"
+                        max="50000"
+                        value={manualRepeatCountInput}
+                        onChange={(e) => {
+                          const inputValue = e.target.value
+                          setManualRepeatCountInput(inputValue)
+                          if (inputValue !== '') {
+                            const numValue = parseInt(inputValue, 10)
+                            if (!isNaN(numValue)) {
+                              const clampedValue = Math.max(1, Math.min(50000, numValue))
+                              setManualRepeatCount(clampedValue)
+                              if (numValue > 50000) {
+                                setManualRepeatCountInput('50000')
+                              }
                             }
                           }
-                        }
-                      }}
-                      onBlur={(e) => {
-                        const inputValue = e.target.value
-                        if (inputValue === '' || inputValue === '0') {
-                          setManualRepeatCountInput('1')
-                          setManualRepeatCount(1)
-                        } else {
-                          const value = parseInt(inputValue, 10)
-                          if (isNaN(value) || value < 1) {
+                        }}
+                        onBlur={(e) => {
+                          const inputValue = e.target.value
+                          if (inputValue === '' || inputValue === '0') {
                             setManualRepeatCountInput('1')
                             setManualRepeatCount(1)
-                          } else if (value > 50000) {
-                            setManualRepeatCountInput('50000')
-                            setManualRepeatCount(50000)
                           } else {
-                            setManualRepeatCountInput(value.toString())
-                            setManualRepeatCount(value)
+                            const value = parseInt(inputValue, 10)
+                            if (isNaN(value) || value < 1) {
+                              setManualRepeatCountInput('1')
+                              setManualRepeatCount(1)
+                            } else if (value > 50000) {
+                              setManualRepeatCountInput('50000')
+                              setManualRepeatCount(50000)
+                            } else {
+                              setManualRepeatCountInput(value.toString())
+                              setManualRepeatCount(value)
+                            }
                           }
-                        }
-                      }}
-                      disabled={isRunning}
-                      className="config-input"
-                    />
-                  </label>
-                </div>
-                <div className="manual-controls">
-                  <button
-                    className="btn-primary"
-                    onClick={runManualTests}
-                    disabled={isRunning}
-                  >
-                    Run Manual Test {manualRepeatCount > 1 ? `(${manualRepeatCount.toLocaleString()}x)` : ''}
-                  </button>
-                </div>
-              </div>
-
-            </div>
-          )}
-
-          {/* Batch Testing Section */}
-          {activeTab === 'batch' && (
-            <div className="testing-section batch-section">
-            <div className="config-section">
-              <div className="config-row">
-                <label className="config-label">
-                  Number of API Calls:
-                  <input
-                    type="number"
-                    min="1"
-                    max="10000"
-                    value={callCountInput}
-                    onChange={(e) => {
-                      const inputValue = e.target.value
-                      // Allow empty input for deletion
-                      setCallCountInput(inputValue)
-                      // Update the actual callCount if it's a valid number
-                      if (inputValue !== '') {
-                        const numValue = parseInt(inputValue, 10)
-                        if (!isNaN(numValue)) {
-                          setCallCount(Math.max(1, Math.min(10000, numValue)))
-                        }
-                      }
-                    }}
-                    onBlur={(e) => {
-                      // Ensure a valid value when field loses focus
-                      const inputValue = e.target.value
-                      if (inputValue === '' || inputValue === '0') {
-                        setCallCountInput('1')
-                        setCallCount(1)
-                      } else {
-                        const value = parseInt(inputValue, 10)
-                        if (isNaN(value) || value < 1) {
-                          setCallCountInput('1')
-                          setCallCount(1)
-                        } else if (value > 10000) {
-                          setCallCountInput('10000')
-                          setCallCount(10000)
-                        } else {
-                          setCallCountInput(value.toString())
-                          setCallCount(value)
-                        }
-                      }
-                    }}
-                    disabled={isRunning}
-                    className="config-input"
-                  />
-                </label>
-                <label className="config-label">
-                  Batch Mode:
-                  <select
-                    value={batchMode}
-                    onChange={(e) => setBatchMode(e.target.value as 'sequential' | 'parallel')}
-                    disabled={isRunning}
-                    className="config-input"
-                    style={{ minWidth: '150px' }}
-                  >
-                    <option value="sequential">Sequential</option>
-                    <option value="parallel">Parallel</option>
-                  </select>
-                </label>
-                {batchMode === 'parallel' && (
+                        }}
+                        disabled={isRunning}
+                        className="config-input"
+                      />
+                    </label>
+                  </div>
+                </>
+              ) : (
+                <div className="config-row">
                   <label className="config-label">
-                    Number of Threads:
+                    Number of API Calls:
                     <input
                       type="number"
                       min="1"
-                      max="50"
-                      value={threadCountInput}
+                      max="10000"
+                      value={callCountInput}
                       onChange={(e) => {
                         const inputValue = e.target.value
-                        setThreadCountInput(inputValue)
+                        setCallCountInput(inputValue)
                         if (inputValue !== '') {
                           const numValue = parseInt(inputValue, 10)
                           if (!isNaN(numValue)) {
-                            setThreadCount(Math.max(1, Math.min(50, numValue)))
+                            setCallCount(Math.max(1, Math.min(10000, numValue)))
                           }
                         }
                       }}
                       onBlur={(e) => {
                         const inputValue = e.target.value
                         if (inputValue === '' || inputValue === '0') {
-                          setThreadCountInput('1')
-                          setThreadCount(1)
+                          setCallCountInput('1')
+                          setCallCount(1)
                         } else {
                           const value = parseInt(inputValue, 10)
                           if (isNaN(value) || value < 1) {
-                            setThreadCountInput('1')
-                            setThreadCount(1)
-                          } else if (value > 50) {
-                            setThreadCountInput('50')
-                            setThreadCount(50)
+                            setCallCountInput('1')
+                            setCallCount(1)
+                          } else if (value > 10000) {
+                            setCallCountInput('10000')
+                            setCallCount(10000)
                           } else {
-                            setThreadCountInput(value.toString())
-                            setThreadCount(value)
+                            setCallCountInput(value.toString())
+                            setCallCount(value)
                           }
                         }
                       }}
@@ -1174,25 +1102,41 @@ export default function Home() {
                       className="config-input"
                     />
                   </label>
-                )}
-              </div>
+                </div>
+              )}
             </div>
 
-            <div className="batch-controls">
-              <button
-                className="btn-primary"
-                onClick={() => runBatchCalls(callCount)}
-                disabled={isRunning || callCount < 1}
-              >
-                {isRunning ? `Running... (${stats.total}/${callCount})` : `Run Batch Test`}
-              </button>
-              <button
-                className="btn-danger"
-                onClick={stopBatchCalls}
-                disabled={!isRunning}
-              >
-                Stop
-              </button>
+            {/* Unified Controls */}
+            <div className="unified-controls" style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginTop: '1rem', marginBottom: '1rem' }}>
+              {activeTab === 'manual' ? (
+                <button
+                  className="btn-primary"
+                  onClick={runManualTests}
+                  disabled={isRunning}
+                >
+                  {isRunning 
+                    ? `Running... (${stats.total}/${manualParams.length * manualRepeatCount})` 
+                    : `Run Manual Test${manualRepeatCount > 1 ? ` (${manualRepeatCount.toLocaleString()}x)` : ''}`
+                  }
+                </button>
+              ) : (
+                <>
+                  <button
+                    className="btn-primary"
+                    onClick={() => runBatchCalls(callCount)}
+                    disabled={isRunning || callCount < 1}
+                  >
+                    {isRunning ? `Running... (${stats.total}/${callCount})` : `Run Batch Test`}
+                  </button>
+                  <button
+                    className="btn-danger"
+                    onClick={stopBatchCalls}
+                    disabled={!isRunning}
+                  >
+                    Stop
+                  </button>
+                </>
+              )}
               <button
                 className="btn-secondary"
                 onClick={clearResults}
@@ -1200,15 +1144,41 @@ export default function Home() {
               >
                 Clear Results
               </button>
-              <button
-                className="btn-secondary"
-                onClick={printResults}
-                disabled={isRunning || results.length === 0}
-              >
-                Print Results
-              </button>
+              {activeTab === 'batch' && (
+                <button
+                  className="btn-secondary"
+                  onClick={printResults}
+                  disabled={isRunning || results.length === 0}
+                >
+                  Print Results
+                </button>
+              )}
             </div>
 
+            {/* Test Timing Info - Unified */}
+            {(testStartTime || testEndTime) && (
+              <div style={{ 
+                background: '#F9F9F9', 
+                padding: '0.75rem', 
+                borderRadius: '8px', 
+                marginBottom: '1rem',
+                border: '1px solid #E0E0E0',
+                fontSize: '0.875rem'
+              }}>
+                {testStartTime && (
+                  <div style={{ marginBottom: '0.25rem' }}>
+                    <strong>Started:</strong> {testStartTime}
+                  </div>
+                )}
+                {testEndTime && (
+                  <div>
+                    <strong>Ended:</strong> {testEndTime}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Unified Stats - Show for both modes */}
             <div className="stats">
               <div className="stat-card">
                 <div className="stat-label">Total Calls</div>
@@ -1240,16 +1210,33 @@ export default function Home() {
               </div>
             </div>
 
-            <div className="progress-bar">
-              <div
-                className="progress-fill"
-                style={{ width: `${progress}%` }}
-              >
-                {progress.toFixed(1)}%
+            {/* Unified Progress Bar - Show for both modes */}
+            {activeTab === 'batch' ? (
+              <div className="progress-bar">
+                <div
+                  className="progress-fill"
+                  style={{ width: `${progress}%` }}
+                >
+                  {progress.toFixed(1)}%
+                </div>
               </div>
-            </div>
-            </div>
-          )}
+            ) : (
+              (() => {
+                const totalExpected = manualParams.filter(p => p.dateString.trim() && p.nin.trim()).length * manualRepeatCount
+                const manualProgress = totalExpected > 0 ? (manualResults.length / totalExpected) * 100 : 0
+                return manualResults.length > 0 && totalExpected > 0 ? (
+                  <div className="progress-bar">
+                    <div
+                      className="progress-fill"
+                      style={{ width: `${Math.min(100, manualProgress)}%` }}
+                    >
+                      {manualProgress.toFixed(1)}%
+                    </div>
+                  </div>
+                ) : null
+              })()
+            )}
+          </div>
         </div>
 
         <div className="right-column">
@@ -1257,7 +1244,10 @@ export default function Home() {
             <div className="chart-section">
               <h2 className="section-title">Live Response Time Graph</h2>
               <ResponsiveContainer width="100%" height={200}>
-                <LineChart data={responseTimeData}>
+                <LineChart 
+                  data={responseTimeData}
+                  margin={{ top: 5, right: 5, left: 5, bottom: 5 }}
+                >
                   <CartesianGrid strokeDasharray="3 3" stroke="#000000" opacity={0.2} />
                   <XAxis 
                     dataKey="time" 
@@ -1278,11 +1268,13 @@ export default function Home() {
                     labelStyle={{ color: '#000000', fontWeight: 600, fontSize: '12px' }}
                   />
                   <Line 
-                    type="monotone" 
+                    type="linear" 
                     dataKey="duration" 
                     stroke="#000000" 
                     strokeWidth={2}
-                    dot={{ r: 3, fill: '#000000', strokeWidth: 1, stroke: '#FFFFFF' }}
+                    dot={false}
+                    activeDot={{ r: 4, fill: '#000000' }}
+                    isAnimationActive={false}
                   />
                 </LineChart>
               </ResponsiveContainer>
@@ -1311,35 +1303,56 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Show Manual Test Results when in manual mode, Batch Results when in batch mode */}
-          {activeTab === 'manual' ? (
-            <div className="results-section">
-              <div className="results-header">
-                <h3 className="section-title">Manual Test Results ({manualResults.length})</h3>
-                {manualResults.length > 0 && (
-                  <div className="pagination">
-                    <button
-                      className="pagination-btn"
-                      onClick={() => setManualCurrentPage(prev => Math.max(1, prev - 1))}
-                      disabled={manualCurrentPage === 1}
-                    >
-                      Previous
-                    </button>
-                    <span className="pagination-info">
-                      Page {manualCurrentPage} of {manualTotalPages} ({manualStartIndex + 1}-{Math.min(manualEndIndex, manualResults.length)} of {manualResults.length})
-                    </span>
-                    <button
-                      className="pagination-btn"
-                      onClick={() => setManualCurrentPage(prev => Math.min(manualTotalPages, prev + 1))}
-                      disabled={manualCurrentPage === manualTotalPages}
-                    >
-                      Next
-                    </button>
-                  </div>
-                )}
-              </div>
-              <div className="results">
-                {manualResults.length === 0 ? (
+          {/* Unified Results Section */}
+          <div className="results-section">
+            <div className="results-header">
+              <h3 className="section-title">
+                {activeTab === 'manual' 
+                  ? `Test Results (${manualResults.length})` 
+                  : `Test Results (${results.length})`
+                }
+              </h3>
+              {((activeTab === 'manual' && manualResults.length > 0) || (activeTab === 'batch' && results.length > 0)) && (
+                <div className="pagination">
+                  <button
+                    className="pagination-btn"
+                    onClick={() => {
+                      if (activeTab === 'manual') {
+                        setManualCurrentPage(prev => Math.max(1, prev - 1))
+                      } else {
+                        setCurrentPage(prev => Math.max(1, prev - 1))
+                      }
+                    }}
+                    disabled={activeTab === 'manual' ? manualCurrentPage === 1 : currentPage === 1}
+                  >
+                    Previous
+                  </button>
+                  <span className="pagination-info">
+                    {activeTab === 'manual' ? (
+                      <>Page {manualCurrentPage} of {manualTotalPages} ({manualStartIndex + 1}-{Math.min(manualEndIndex, manualResults.length)} of {manualResults.length})</>
+                    ) : (
+                      <>Page {currentPage} of {totalPages} ({startIndex + 1}-{Math.min(endIndex, results.length)} of {results.length})</>
+                    )}
+                  </span>
+                  <button
+                    className="pagination-btn"
+                    onClick={() => {
+                      if (activeTab === 'manual') {
+                        setManualCurrentPage(prev => Math.min(manualTotalPages, prev + 1))
+                      } else {
+                        setCurrentPage(prev => Math.min(totalPages, prev + 1))
+                      }
+                    }}
+                    disabled={activeTab === 'manual' ? manualCurrentPage === manualTotalPages : currentPage === totalPages}
+                  >
+                    Next
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="results">
+              {activeTab === 'manual' ? (
+                manualResults.length === 0 ? (
                   <p className="empty-state">
                     No results yet. Enter dateString and nin, then click &quot;Run Manual Test&quot; to start testing.
                   </p>
@@ -1350,7 +1363,7 @@ export default function Home() {
                       className={`result-item ${result.status} manual-result-item`}
                     >
                       <div className="result-header">
-                        <span>Manual Test #{manualStartIndex + index + 1}</span>
+                        <span>Test #{manualStartIndex + index + 1}</span>
                         <span>{result.duration}ms</span>
                       </div>
                       <div className="result-body">
@@ -1360,6 +1373,7 @@ export default function Home() {
                         </div>
                         <div style={{ marginTop: '0.5rem' }}>
                           <strong>Status:</strong> {result.status.toUpperCase()}
+                          {result.statusCode && <span style={{ marginLeft: '0.5rem', opacity: 0.7 }}>({result.statusCode})</span>}
                         </div>
                         {result.error && (
                           <div style={{ marginTop: '0.5rem', color: '#000000' }}>
@@ -1377,37 +1391,9 @@ export default function Home() {
                       </div>
                     </div>
                   ))
-                )}
-              </div>
-            </div>
-          ) : (
-            <div className="results-section">
-              <div className="results-header">
-                <h3 className="section-title">Batch Results ({results.length})</h3>
-                {results.length > 0 && (
-                  <div className="pagination">
-                    <button
-                      className="pagination-btn"
-                      onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
-                      disabled={currentPage === 1}
-                    >
-                      Previous
-                    </button>
-                    <span className="pagination-info">
-                      Page {currentPage} of {totalPages} ({startIndex + 1}-{Math.min(endIndex, results.length)} of {results.length})
-                    </span>
-                    <button
-                      className="pagination-btn"
-                      onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
-                      disabled={currentPage === totalPages}
-                    >
-                      Next
-                    </button>
-                  </div>
-                )}
-              </div>
-              <div className="results">
-                {results.length === 0 ? (
+                )
+              ) : (
+                results.length === 0 ? (
                   <p className="empty-state">
                     No results yet. Enter the number of calls and click &quot;Run Batch Test&quot; to start testing.
                   </p>
@@ -1418,7 +1404,7 @@ export default function Home() {
                       className={`result-item ${result.status}`}
                     >
                       <div className="result-header">
-                        <span>#{result.id}</span>
+                        <span>Test #{result.id}</span>
                         <span>{result.duration}ms</span>
                       </div>
                       <div className="result-body">
@@ -1428,6 +1414,7 @@ export default function Home() {
                         </div>
                         <div style={{ marginTop: '0.5rem' }}>
                           <strong>Status:</strong> {result.status.toUpperCase()}
+                          {result.statusCode && <span style={{ marginLeft: '0.5rem', opacity: 0.7 }}>({result.statusCode})</span>}
                         </div>
                         {result.error && (
                           <div style={{ marginTop: '0.5rem', color: '#000000' }}>
@@ -1445,10 +1432,58 @@ export default function Home() {
                       </div>
                     </div>
                   ))
-                )}
-              </div>
+                )
+              )}
             </div>
-          )}
+          </div>
+
+          <div className="logs-section">
+            <h2 className="section-title">API Response Log</h2>
+            <div className="logs-container">
+              {apiLogs.length === 0 ? (
+                <div className="empty-state">No logs yet. Start testing to see API responses.</div>
+              ) : (
+                <table className="api-logs-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Response Code</th>
+                      <th>Response Preview</th>
+                      <th>Time (ms)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {apiLogs.map((log, index) => {
+                      const getStatusCodeColor = (code: number) => {
+                        if (code >= 200 && code < 300) return '#28a745' // Green for 2xx
+                        if (code >= 300 && code < 400) return '#17a2b8' // Blue for 3xx
+                        if (code >= 400 && code < 500) return '#ffc107' // Yellow/Orange for 4xx
+                        if (code >= 500) return '#dc3545' // Red for 5xx
+                        return '#6c757d' // Gray for 0 or unknown
+                      }
+                      
+                      return (
+                        <tr key={index}>
+                          <td className="log-serial">{log.serial}</td>
+                          <td 
+                            className="log-status-code"
+                            style={{ 
+                              color: getStatusCodeColor(log.statusCode),
+                              fontWeight: 'bold'
+                            }}
+                          >
+                            {log.statusCode || 'N/A'}
+                          </td>
+                          <td className="log-preview">{log.responsePreview || '-'}</td>
+                          <td className="log-time">{log.time}ms</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>

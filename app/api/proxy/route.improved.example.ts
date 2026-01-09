@@ -1,6 +1,22 @@
+/**
+ * IMPROVED PROXY ROUTE EXAMPLE
+ * 
+ * This is an example showing how to improve the proxy route with:
+ * - Input validation
+ * - Better error handling
+ * - Type safety
+ * - Constants usage
+ * 
+ * To use: Copy the improvements to route.ts
+ */
+
 import { NextRequest, NextResponse } from 'next/server'
 import https from 'https'
 import dns from 'dns'
+import { validateApiParams } from '@/lib/utils/validation'
+import { standardizeError } from '@/lib/utils/errors'
+import { API_CONFIG } from '@/lib/constants'
+import type { ProxyApiResponse } from '@/lib/types/api'
 
 export const dynamic = 'force-dynamic'
 
@@ -9,7 +25,7 @@ const httpsAgent = new https.Agent({
   keepAliveMsecs: 1000,
   maxSockets: 100,
   maxFreeSockets: 50,
-  timeout: 30000,
+  timeout: API_CONFIG.TIMEOUT_MS,
   rejectUnauthorized: false,
   lookup: dns.lookup,
 })
@@ -33,9 +49,22 @@ export async function GET(request: NextRequest) {
   const dateString = searchParams.get('dateString')
   const nin = searchParams.get('nin')
 
+  // Validate required parameters
   if (!dateString || !nin) {
     return NextResponse.json(
       { error: 'Missing required parameters: dateString and nin' },
+      { status: 400 }
+    )
+  }
+
+  // Validate parameter formats
+  const validation = validateApiParams(dateString, nin)
+  if (!validation.valid) {
+    return NextResponse.json(
+      { 
+        error: 'Invalid parameters',
+        details: validation.errors,
+      },
       { status: 400 }
     )
   }
@@ -54,10 +83,8 @@ export async function GET(request: NextRequest) {
     const queryString = `dateString=${encodeURIComponent(dateString)}&nin=${encodeURIComponent(nin)}`
     const path = `${API_PATH_PREFIX}?${queryString}`
 
-    const REQUEST_TIMEOUT = 10000
-
     const response = await Promise.race([
-      new Promise<any>((resolve, reject) => {
+      new Promise<ProxyApiResponse>((resolve, reject) => {
         const options = {
           hostname: API_HOSTNAME,
           port: API_PORT,
@@ -85,7 +112,7 @@ export async function GET(request: NextRequest) {
             const buffer = Buffer.concat(chunks)
             const dataString = buffer.toString('utf8')
             
-            let jsonData
+            let jsonData: unknown
             try {
               jsonData = JSON.parse(dataString)
             } catch {
@@ -95,13 +122,13 @@ export async function GET(request: NextRequest) {
             resolve({
               status: res.statusCode || 200,
               ok: (res.statusCode || 200) >= 200 && (res.statusCode || 200) < 300,
-              data: jsonData,
+              data: jsonData as ProxyApiResponse['data'],
               responseTime: apiResponseTime,
             })
           })
         })
 
-        req.on('error', (error) => {
+        req.on('error', (error: NodeJS.ErrnoException) => {
           if (timeoutId) clearTimeout(timeoutId)
           const apiEndTime = Date.now()
           const apiResponseTime = apiStartTime ? apiEndTime - apiStartTime : 0
@@ -111,20 +138,20 @@ export async function GET(request: NextRequest) {
         timeoutId = setTimeout(() => {
           req.destroy()
           const apiEndTime = Date.now()
-          const apiResponseTime = apiStartTime ? apiEndTime - apiStartTime : REQUEST_TIMEOUT
+          const apiResponseTime = apiStartTime ? apiEndTime - apiStartTime : API_CONFIG.TIMEOUT_MS
           reject({ 
             error: new Error('Request timeout'), 
             responseTime: apiResponseTime 
           })
-        }, REQUEST_TIMEOUT)
+        }, API_CONFIG.TIMEOUT_MS)
 
         req.end()
       }),
-      new Promise<any>((_, reject) => 
+      new Promise<never>((_, reject) => 
         setTimeout(() => reject({ 
           error: new Error('Request timeout'), 
-          responseTime: REQUEST_TIMEOUT 
-        }), REQUEST_TIMEOUT)
+          responseTime: API_CONFIG.TIMEOUT_MS 
+        }), API_CONFIG.TIMEOUT_MS)
       )
     ])
 
@@ -134,28 +161,27 @@ export async function GET(request: NextRequest) {
       data: response.data,
       responseTime: response.responseTime,
     })
-  } catch (error: any) {
-    console.error('Proxy error:', error)
-    const actualError = error.error || error
-    const errorMessage = actualError.message || 'Failed to fetch'
-    const errorDetails = actualError.toString()
-    const responseTime = error.responseTime || 0
+  } catch (error: unknown) {
+    // Use standardized error handling
+    const standardized = standardizeError(error)
+    const responseTime = (error as { responseTime?: number })?.responseTime || 0
     
-    let detailedError = errorMessage
-    if (actualError.code === 'CERT_HAS_EXPIRED' || actualError.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
-      detailedError = `SSL Certificate Error: ${errorMessage}. The API may be using a self-signed certificate.`
-    } else if (actualError.code === 'ENOTFOUND' || actualError.code === 'ECONNREFUSED') {
-      detailedError = `Connection Error: ${errorMessage}. Cannot reach the API server.`
-    }
+    console.error('Proxy error:', {
+      message: standardized.message,
+      code: standardized.code,
+      statusCode: standardized.statusCode,
+      retryable: standardized.retryable,
+    })
     
     return NextResponse.json(
       { 
-        error: detailedError,
-        details: errorDetails,
-        code: actualError.code,
+        error: standardized.userFriendlyMessage,
+        details: standardized.message,
+        code: standardized.code,
+        retryable: standardized.retryable,
         responseTime: responseTime,
       },
-      { status: 500 }
+      { status: standardized.statusCode || 500 }
     )
   }
 }
